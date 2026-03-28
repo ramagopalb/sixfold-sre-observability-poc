@@ -1,0 +1,142 @@
+# Prometheus Helm values for Sixfold SRE platform
+# Deploy: helm upgrade --install prometheus prometheus-community/kube-prometheus-stack -f prometheus-values.yaml
+
+prometheus:
+  prometheusSpec:
+    retention: 30d
+    retentionSize: "50GB"
+    scrapeInterval: "15s"
+    evaluationInterval: "15s"
+
+    # Remote write to Thanos for long-term storage
+    remoteWrite:
+      - url: "http://thanos-receive:10908/api/v1/receive"
+        queueConfig:
+          maxSamplesPerSend: 10000
+          maxShards: 30
+          capacity: 2500
+
+    resources:
+      requests:
+        memory: "2Gi"
+        cpu: "500m"
+      limits:
+        memory: "8Gi"
+        cpu: "2000m"
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 100Gi
+
+    # Additional scrape configs for Sixfold services
+    additionalScrapeConfigs:
+      - job_name: "risk-score-api"
+        static_configs:
+          - targets: ["risk-score-api:8080"]
+        metrics_path: /metrics
+        scrape_interval: 15s
+
+      - job_name: "llm-inference"
+        static_configs:
+          - targets: ["llm-inference:8080"]
+        metrics_path: /metrics
+        scrape_interval: 15s
+
+      - job_name: "submission-ingestion"
+        static_configs:
+          - targets: ["submission-ingestion:8080"]
+        metrics_path: /metrics
+        scrape_interval: 15s
+
+      - job_name: "underwriting-api"
+        static_configs:
+          - targets: ["underwriting-api:8080"]
+        metrics_path: /metrics
+        scrape_interval: 15s
+
+# Alertmanager configuration
+alertmanager:
+  config:
+    global:
+      resolve_timeout: 5m
+
+    route:
+      group_by: ["alertname", "service", "severity"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: "default"
+      routes:
+        # P1 alerts — page immediately
+        - match:
+            severity: critical
+          receiver: pagerduty-p1
+          continue: false
+
+        # P2 alerts — ticket
+        - match:
+            severity: warning
+          receiver: pagerduty-p2
+          continue: true
+
+        # All alerts — Slack notification
+        - match_re:
+            severity: "critical|warning|info"
+          receiver: slack-sre
+
+    receivers:
+      - name: "default"
+        slack_configs:
+          - api_url: "{{ SLACK_WEBHOOK_URL }}"
+            channel: "#sre-alerts"
+            title: "{{ .GroupLabels.alertname }}"
+            text: "{{ range .Alerts }}{{ .Annotations.description }}{{ end }}"
+
+      - name: "pagerduty-p1"
+        pagerduty_configs:
+          - service_key: "{{ PAGERDUTY_P1_KEY }}"
+            severity: critical
+            description: "{{ .GroupLabels.alertname }}: {{ .CommonAnnotations.summary }}"
+
+      - name: "pagerduty-p2"
+        pagerduty_configs:
+          - service_key: "{{ PAGERDUTY_P2_KEY }}"
+            severity: warning
+
+      - name: "slack-sre"
+        slack_configs:
+          - api_url: "{{ SLACK_WEBHOOK_URL }}"
+            channel: "#sre-incidents"
+            title: "[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}"
+
+grafana:
+  enabled: true
+  adminPassword: "{{ GRAFANA_ADMIN_PASSWORD }}"
+
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: "sixfold-sre"
+          orgId: 1
+          folder: "Sixfold SRE"
+          type: file
+          disableDeletion: false
+          options:
+            path: /var/lib/grafana/dashboards/sixfold
+
+  persistence:
+    enabled: true
+    size: 10Gi
+
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "250m"
+    limits:
+      memory: "2Gi"
+      cpu: "1000m"

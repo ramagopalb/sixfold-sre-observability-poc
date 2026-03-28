@@ -1,0 +1,138 @@
+# OpenTelemetry Collector Deployment for Sixfold
+# Collects traces, metrics, and logs from all AI platform services
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: monitoring
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch:
+        timeout: 10s
+        send_batch_size: 1024
+      resource:
+        attributes:
+          - action: insert
+            key: deployment.environment
+            value: production
+          - action: insert
+            key: service.namespace
+            value: sixfold
+      filter/drop_health:
+        traces:
+          span:
+            - 'attributes["http.target"] == "/healthz"'
+            - 'attributes["http.target"] == "/readyz"'
+
+    exporters:
+      prometheus:
+        endpoint: "0.0.0.0:8889"
+        namespace: sixfold
+      otlp/tempo:
+        endpoint: "tempo:4317"
+        tls:
+          insecure: true
+      loki:
+        endpoint: "http://loki:3100/loki/api/v1/push"
+        labels:
+          resource:
+            service.name: service_name
+            deployment.environment: env
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [resource, filter/drop_health, batch]
+          exporters: [otlp/tempo]
+        metrics:
+          receivers: [otlp]
+          processors: [resource, batch]
+          exporters: [prometheus]
+        logs:
+          receivers: [otlp]
+          processors: [resource, batch]
+          exporters: [loki]
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: monitoring
+  labels:
+    app: otel-collector
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.91.0
+          args: ["--config=/conf/config.yaml"]
+          ports:
+            - containerPort: 4317   # OTLP gRPC
+            - containerPort: 4318   # OTLP HTTP
+            - containerPort: 8889   # Prometheus metrics
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: otel-collector-pdb
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: otel-collector
+  minAvailable: 1
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: monitoring
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: metrics
+      port: 8889
+      targetPort: 8889
